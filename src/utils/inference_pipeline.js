@@ -1,5 +1,5 @@
 import * as ort from "onnxruntime-web/webgpu";
-import { preProcess_dynamic, applyNMS, Colors } from "./img_preprocess";
+import { preProcess_dynamic, preProcess, applyNMS, Colors } from "./img_preprocess";
 
 export const inference_pipeline = async (
   input_el,
@@ -14,6 +14,12 @@ export const inference_pipeline = async (
     preProcess_dynamic(src_mat);
   const xRatio = src_mat.cols / div_width;
   const yRatio = src_mat.rows / div_height;
+
+  // const [src_mat_preProcessed, xRatio, yRatio] = await preProcess(
+  //   src_mat,
+  //   sessionsConfig.input_shape[2],
+  //   sessionsConfig.input_shape[3]
+  // );
 
   src_mat.delete();
 
@@ -97,120 +103,123 @@ export const inference_pipeline = async (
   const filtered_results = selected_indices.map((i) => results[i]);
 
   // mask process
-  const proto_mask_mat = cv.matFromArray(
-    MASK_CHANNELS, // 32
-    MASK_HEIGHT * MASK_WIDTH, // 128 * 128
-    cv.CV_32F,
-    proto_mask
-  );
-
-  // weights x proto_mask
-  const NUM_FILTERED_RESULTS = filtered_results.length;
-  const mask_weights = filtered_results
-    .map((r) => Array.from(r.mask_weights))
-    .flat();
-  const mask_weights_mat = cv.matFromArray(
-    NUM_FILTERED_RESULTS,
-    MASK_CHANNELS,
-    cv.CV_32F,
-    mask_weights
-  );
-  const weights_mul_proto_mat = new cv.Mat();
-  cv.gemm(
-    mask_weights_mat,
-    proto_mask_mat,
-    1.0,
-    new cv.Mat(),
-    0.0,
-    weights_mul_proto_mat
-  );
-
-  proto_mask_mat.delete();
-  mask_weights_mat.delete();
-
-  // sigmoid
-  const mask_sigmoid_mat = new cv.Mat();
-  const ones_mat = cv.Mat.ones(weights_mul_proto_mat.size(), cv.CV_32F);
-  cv.multiply(weights_mul_proto_mat, ones_mat, mask_sigmoid_mat, -1);
-  cv.exp(mask_sigmoid_mat, mask_sigmoid_mat);
-  cv.add(mask_sigmoid_mat, ones_mat, mask_sigmoid_mat);
-  cv.divide(ones_mat, mask_sigmoid_mat, mask_sigmoid_mat);
-
-  ones_mat.delete();
-  weights_mul_proto_mat.delete();
-
-  // same size overlay mat
-  const overlay_mat = new cv.Mat(
-    overlay_el.height,
-    overlay_el.width,
-    cv.CV_8UC4,
-    new cv.Scalar(0, 0, 0, 0)
-  );
-
-  for (let i = 0; i < NUM_FILTERED_RESULTS; i++) {
-    // reshape
-    const mask = mask_sigmoid_mat.row(i).data32F;
-    const mask_mat = cv.matFromArray(MASK_HEIGHT, MASK_WIDTH, cv.CV_32F, mask);
-
-    // upsample to overlay size
-    const mask_resized_mat = new cv.Mat();
-    cv.resize(
-      mask_mat,
-      mask_resized_mat,
-      new cv.Size(overlay_el.width, overlay_el.height),
-      cv.INTER_LINEAR
+  if (filtered_results.length > 0) {
+    const proto_mask_mat = cv.matFromArray(
+      MASK_CHANNELS, // 32
+      MASK_HEIGHT * MASK_WIDTH, // 128 * 128
+      cv.CV_32F,
+      proto_mask
     );
 
-    // threshold
-    const mask_binary_mat = new cv.Mat();
-    const mask_binary_u8_mat = new cv.Mat();
-    cv.threshold(mask_resized_mat, mask_binary_mat, 0.5, 1, cv.THRESH_BINARY);
-    mask_binary_mat.convertTo(mask_binary_u8_mat, cv.CV_8U);
-
-    // crop and color
-    const [x, y, w, h] = filtered_results[i].bbox;
-    const x1 = Math.max(0, x);
-    const y1 = Math.max(0, y);
-    const x2 = Math.min(overlay_el.width, x + w);
-    const y2 = Math.min(overlay_el.height, y + h);
-
-    const roi = mask_binary_u8_mat.roi(new cv.Rect(x1, y1, x2 - x1, y2 - y1));
-    const color = Colors.getColor(filtered_results[i].class_idx, 0.6);
-    const color_scalar = new cv.Scalar(
-      color[0],
-      color[1],
-      color[2],
-      color[3] * 255
+    // weights x proto_mask
+    const NUM_FILTERED_RESULTS = filtered_results.length;
+    const mask_weights = filtered_results
+      .map((r) => Array.from(r.mask_weights))
+      .flat();
+    const mask_weights_mat = cv.matFromArray(
+      NUM_FILTERED_RESULTS,
+      MASK_CHANNELS,
+      cv.CV_32F,
+      mask_weights
     );
-    const mask_colored_mat = new cv.Mat(
-      roi.rows,
-      roi.cols,
+    const weights_mul_proto_mat = new cv.Mat();
+    cv.gemm(
+      mask_weights_mat,
+      proto_mask_mat,
+      1.0,
+      new cv.Mat(),
+      0.0,
+      weights_mul_proto_mat
+    );
+
+    proto_mask_mat.delete();
+    mask_weights_mat.delete();
+
+    // sigmoid
+    const mask_sigmoid_mat = new cv.Mat();
+    const ones_mat = cv.Mat.ones(weights_mul_proto_mat.size(), cv.CV_32F);
+    cv.multiply(weights_mul_proto_mat, ones_mat, mask_sigmoid_mat, -1);
+    cv.exp(mask_sigmoid_mat, mask_sigmoid_mat);
+    cv.add(mask_sigmoid_mat, ones_mat, mask_sigmoid_mat);
+    cv.divide(ones_mat, mask_sigmoid_mat, mask_sigmoid_mat);
+
+    ones_mat.delete();
+    weights_mul_proto_mat.delete();
+
+    // same size overlay mat
+    const overlay_mat = new cv.Mat(
+      overlay_el.height,
+      overlay_el.width,
       cv.CV_8UC4,
-      color_scalar
-    );
-    mask_colored_mat.copyTo(
-      overlay_mat.roi(new cv.Rect(x1, y1, x2 - x1, y2 - y1)),
-      roi
+      new cv.Scalar(0, 0, 0, 0)
     );
 
-    roi.delete();
-    mask_resized_mat.delete();
-    mask_binary_mat.delete();
-    mask_mat.delete();
-    mask_colored_mat.delete();
+    for (let i = 0; i < NUM_FILTERED_RESULTS; i++) {
+      // reshape
+      const mask = mask_sigmoid_mat.row(i).data32F;
+      const mask_mat = cv.matFromArray(MASK_HEIGHT, MASK_WIDTH, cv.CV_32F, mask);
+
+      // upsample to overlay size
+      const mask_resized_mat = new cv.Mat();
+      cv.resize(
+        mask_mat,
+        mask_resized_mat,
+        new cv.Size(overlay_el.width, overlay_el.height),
+        cv.INTER_LINEAR
+      );
+
+      // threshold
+      const mask_binary_mat = new cv.Mat();
+      const mask_binary_u8_mat = new cv.Mat();
+      cv.threshold(mask_resized_mat, mask_binary_mat, 0.5, 1, cv.THRESH_BINARY);
+      mask_binary_mat.convertTo(mask_binary_u8_mat, cv.CV_8U);
+
+      // crop and color
+      const [x, y, w, h] = filtered_results[i].bbox;
+      const x1 = Math.max(0, x);
+      const y1 = Math.max(0, y);
+      const x2 = Math.min(overlay_el.width, x + w);
+      const y2 = Math.min(overlay_el.height, y + h);
+
+      const roi = mask_binary_u8_mat.roi(new cv.Rect(x1, y1, x2 - x1, y2 - y1));
+      const color = Colors.getColor(filtered_results[i].class_idx, 0.6);
+      const color_scalar = new cv.Scalar(
+        color[0],
+        color[1],
+        color[2],
+        color[3] * 255
+      );
+      const mask_colored_mat = new cv.Mat(
+        roi.rows,
+        roi.cols,
+        cv.CV_8UC4,
+        color_scalar
+      );
+      mask_colored_mat.copyTo(
+        overlay_mat.roi(new cv.Rect(x1, y1, x2 - x1, y2 - y1)),
+        roi
+      );
+
+      roi.delete();
+      mask_resized_mat.delete();
+      mask_binary_mat.delete();
+      mask_mat.delete();
+      mask_colored_mat.delete();
+    }
+    mask_sigmoid_mat.delete();
+
+    // draw masks
+    const imgData = new ImageData(
+      new Uint8ClampedArray(overlay_mat.data),
+      overlay_el.width,
+      overlay_el.height
+    );
+    const ctx = overlay_el.getContext("2d");
+    ctx.clearRect(0, 0, overlay_el.width, overlay_el.height);
+    ctx.putImageData(imgData, 0, 0);
+
+    overlay_mat.delete();
   }
-  mask_sigmoid_mat.delete();
 
-
-  // draw masks
-  const imgData = new ImageData(
-    new Uint8ClampedArray(overlay_mat.data),
-    overlay_el.width,
-    overlay_el.height
-  );
-  const ctx = overlay_el.getContext("2d");
-  ctx.putImageData(imgData, 0, 0);
-
-  overlay_mat.delete();
   return [filtered_results, (end - start).toFixed(2)];
 };
