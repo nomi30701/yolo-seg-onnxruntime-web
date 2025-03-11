@@ -1,4 +1,4 @@
-# yolo  pose estimation Browser onnxruntime-web
+# YOLO11 Instance Segmentation Browser onnxruntime-web
 
 <img src="https://github.com/nomi30701/yolo-segmentation-onnxruntime-web/blob/main/preview.png" height=80% width=80%>
 
