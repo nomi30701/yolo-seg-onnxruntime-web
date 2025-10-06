@@ -1,45 +1,118 @@
-import * as ort from "onnxruntime-web/webgpu";
-import { preProcess_dynamic, preProcess, applyNMS, Colors } from "./img_preprocess";
+import cvReadyPromise from "@techstark/opencv-js";
+import { preProcess_img, applyNMS, Colors } from "./img_preprocess";
 
-export const inference_pipeline = async (
-  input_el,
+let cv;
+
+// init opencvjs
+(async () => {
+  cv = await cvReadyPromise;
+})();
+
+/**
+ * Inference pipeline for YOLO model.
+ * @param {HTMLImageElement|HTMLCanvasElement|OffscreenCanvas} imageSource - Input image source
+ * @param {ort.InferenceSession} session - YOLO model ort session.
+ * @param {[Number, Number]} overlay_size - Overlay width and height. [width, height]
+ * @param {object} model_config - Model configuration object.
+ * @returns {[object, string]} Tuple containing:
+ *   - First element: object with inference results:
+ *     - bbox_results: Array<Object> - Filtered detection results after NMS, each containing:
+ *       - bbox: [x, y, width, height] in original image coordinates
+ *       - class_idx: Predicted class index
+ *       - score: Confidence score (0-1)
+ *       - mask_weights: For segmentation tasks: mask coefficients
+ *     - mask_imgData?: For segmentation tasks: RGBA overlay image with colored masks
+ *   - Second element: Inference time in milliseconds (formatted to 2 decimal places)
+ *
+ */
+export async function inference_pipeline(
+  imageSource,
   session,
-  config,
-  overlay_el
-) => {
-  const src_mat = cv.imread(input_el);
+  overlay_size,
+  model_config
+) {
+  try {
+    // Read DOM to cv.Mat
+    const src_mat = cv.imread(imageSource);
 
-  // pre process
-  const [src_mat_preProcessed, div_width, div_height] =
-    preProcess_dynamic(src_mat);
-  const xRatio = src_mat.cols / div_width;
-  const yRatio = src_mat.rows / div_height;
+    // Pre-process img, inference
+    const [input_tensor, xRatio, yRatio] = preProcess_img(
+      src_mat,
+      overlay_size,
+      model_config.imgsz_type
+    );
+    src_mat.delete();
 
-  // const [src_mat_preProcessed, xRatio, yRatio] = await preProcess(
-  //   src_mat,
-  //   sessionsConfig.input_shape[2],
-  //   sessionsConfig.input_shape[3]
-  // );
+    const start = performance.now();
+    const { output0, output1 } = await session.run({
+      images: input_tensor,
+    });
+    const end = performance.now();
+    input_tensor.dispose();
 
-  src_mat.delete();
+    // Post process
+    const [results, masksData] = postProcess_segment(
+      output0,
+      output1,
+      model_config.score_threshold,
+      xRatio,
+      yRatio
+    );
+    output0.dispose();
+    output1.dispose();
 
-  const input_tensor = new ort.Tensor("float32", src_mat_preProcessed.data32F, [
-    1,
-    3,
-    div_height,
-    div_width,
-  ]);
-  src_mat_preProcessed.delete();
+    // Apply NMS
+    const selected_indices = applyNMS(
+      results,
+      results.map((r) => r.score),
+      model_config.iou_threshold
+    );
+    const filtered_results = selected_indices.map((i) => results[i]);
 
-  // inference
-  const start = performance.now();
-  const { output0, output1 } = await session.run({
-    images: input_tensor,
-  });
-  const end = performance.now();
-  input_tensor.dispose();
+    const mask_imgData = postProcess_mask(
+      filtered_results,
+      masksData,
+      overlay_size
+    );
 
-  // post process
+    return [{ filtered_results, mask_imgData }, (end - start).toFixed(2)];
+  } catch (error) {
+    console.error("Inference error:", error);
+    return [[], "0.00"];
+  }
+}
+
+/**
+ * Post process segmentation raw outputs
+ *
+ * @param {ort.Tensor} output0 - YOLO model detection output (shape: [1, G, 4 + C + M])
+ * @param {ort.Tensor} output1 - YOLO model prototype masks (shape: [1, M, Hm, Wm])
+ * @param {number} score_threshold - Score threshold for filtering detections (0-1)
+ * @param {number} xRatio - Horizontal scale ratio to map boxes to original image
+ * @param {number} yRatio - Vertical scale ratio to map boxes to original image
+ * @returns {[Array<Object>, Object]} Returns a tuple [results, masksData]
+ *   - results: Array of instance results. Each item:
+ *     {
+ *       bbox: [number, number, number, number], // [x, y, w, h] in original image coords
+ *       class_idx: number,                      // predicted class index
+ *       score: number,                          // confidence score
+ *       mask_weights: Float32Array              // length M, mask coefficients for prototypes
+ *     }
+ *   - masksData: Object containing mask prototype info:
+ *     {
+ *       proto_mask: Float32Array, // flattened proto data length = M * Hm * Wm
+ *       MASK_CHANNELS: number,    // M
+ *       MASK_HEIGHT: number,      // Hm
+ *       MASK_WIDTH: number        // Wm
+ *     }
+ */
+function postProcess_segment(
+  output0,
+  output1,
+  score_threshold,
+  xRatio,
+  yRatio
+) {
   const NUM_PREDICTIONS = output0.dims[2];
   const NUM_BBOX_ATTRS = 4;
   const NUM_SCORES = 80;
@@ -59,10 +132,9 @@ export const inference_pipeline = async (
   const MASK_CHANNELS = output1.dims[1];
   const MASK_HEIGHT = output1.dims[2];
   const MASK_WIDTH = output1.dims[3];
-  output0.dispose();
-  output1.dispose();
 
-  const results = [];
+  const results = new Array();
+  let resultCount = 0;
   for (let i = 0; i < NUM_PREDICTIONS; i++) {
     let maxScore = 0;
     let class_idx = -1;
@@ -74,45 +146,60 @@ export const inference_pipeline = async (
         class_idx = c;
       }
     }
-    if (maxScore <= config.score_threshold) continue;
+    if (maxScore <= score_threshold) continue;
 
     const w = bbox_data[i + NUM_PREDICTIONS * 2] * xRatio;
     const h = bbox_data[i + NUM_PREDICTIONS * 3] * yRatio;
-    const x = bbox_data[i] * xRatio - 0.5 * w;
-    const y = bbox_data[i + NUM_PREDICTIONS] * yRatio - 0.5 * h;
+    const tlx = bbox_data[i] * xRatio - 0.5 * w;
+    const tly = bbox_data[i + NUM_PREDICTIONS] * yRatio - 0.5 * h;
 
     const mask_weights = new Float32Array(NUM_MASK_WEIGHTS);
     for (let c = 0; c < NUM_MASK_WEIGHTS; c++) {
       mask_weights[c] = mask_weights_data[i + c * NUM_PREDICTIONS];
     }
 
-    results.push({
-      bbox: [x, y, w, h],
+    results[resultCount++] = {
+      bbox: [tlx, tly, w, h],
       class_idx,
       score: maxScore,
       mask_weights,
-    });
+    };
   }
 
-  // nms
-  const selected_indices = applyNMS(
-    results,
-    results.map((r) => r.score),
-    config.iou_threshold
+  const masksData = {
+    proto_mask,
+    MASK_CHANNELS,
+    MASK_HEIGHT,
+    MASK_WIDTH,
+  };
+
+  return [results, masksData];
+}
+
+/**
+ *
+ * @param {*} filtered_results - NMS filtered results
+ * @param {*} masksData - output1 data (mask weights)
+ * @param {*} overlay_size - Size of the overlay. [width, height]
+ * @returns {ImageData} - ImageData object for the overlay
+ */
+function postProcess_mask(filtered_results, masksData, overlay_size) {
+  if (!filtered_results || filtered_results.length === 0) return null;
+  const { proto_mask, MASK_CHANNELS, MASK_HEIGHT, MASK_WIDTH } = masksData;
+
+  // proto_mask: [1, 32*160*160] -> cv.Mat(32, 160*160)
+  const proto_mask_mat = cv.matFromArray(
+    MASK_CHANNELS,
+    MASK_HEIGHT * MASK_WIDTH,
+    cv.CV_32F,
+    proto_mask
   );
-  const filtered_results = selected_indices.map((i) => results[i]);
 
-  // mask process
-  if (filtered_results.length > 0) {
-    const proto_mask_mat = cv.matFromArray(
-      MASK_CHANNELS, // 32
-      MASK_HEIGHT * MASK_WIDTH, // 128 * 128
-      cv.CV_32F,
-      proto_mask
-    );
-
-    // weights x proto_mask
+  try {
+    // Weights x Proto_mask
     const NUM_FILTERED_RESULTS = filtered_results.length;
+
+    // mask_weights: [1, N*32] -> cv.Mat(N, 32)
     const mask_weights = filtered_results
       .map((r) => Array.from(r.mask_weights))
       .flat();
@@ -122,23 +209,34 @@ export const inference_pipeline = async (
       cv.CV_32F,
       mask_weights
     );
+
     const weights_mul_proto_mat = new cv.Mat();
     cv.gemm(
-      mask_weights_mat,
-      proto_mask_mat,
+      mask_weights_mat, // [N, 32]
+      proto_mask_mat, // [32, 160*160]
       1.0,
       new cv.Mat(),
       0.0,
-      weights_mul_proto_mat
+      weights_mul_proto_mat, // [N, 160*160]
+      0
     );
 
     proto_mask_mat.delete();
     mask_weights_mat.delete();
 
-    // sigmoid
+    // Sigmoid
     const mask_sigmoid_mat = new cv.Mat();
     const ones_mat = cv.Mat.ones(weights_mul_proto_mat.size(), cv.CV_32F);
-    cv.multiply(weights_mul_proto_mat, ones_mat, mask_sigmoid_mat, -1);
+
+    const temp_mat2 = new cv.Mat(
+      weights_mul_proto_mat.rows,
+      weights_mul_proto_mat.cols,
+      cv.CV_32F,
+      new cv.Scalar(-1)
+    );
+    cv.multiply(weights_mul_proto_mat, temp_mat2, mask_sigmoid_mat);
+    temp_mat2.delete();
+
     cv.exp(mask_sigmoid_mat, mask_sigmoid_mat);
     cv.add(mask_sigmoid_mat, ones_mat, mask_sigmoid_mat);
     cv.divide(ones_mat, mask_sigmoid_mat, mask_sigmoid_mat);
@@ -146,42 +244,54 @@ export const inference_pipeline = async (
     ones_mat.delete();
     weights_mul_proto_mat.delete();
 
-    // same size overlay mat
+    // Create mask overlay
     const overlay_mat = new cv.Mat(
-      overlay_el.height,
-      overlay_el.width,
+      overlay_size[1],
+      overlay_size[0],
       cv.CV_8UC4,
       new cv.Scalar(0, 0, 0, 0)
     );
 
-    for (let i = 0; i < NUM_FILTERED_RESULTS; i++) {
-      // reshape
-      const mask = mask_sigmoid_mat.row(i).data32F;
-      const mask_mat = cv.matFromArray(MASK_HEIGHT, MASK_WIDTH, cv.CV_32F, mask);
+    const mask_resized_mat = new cv.Mat();
+    const mask_binary_mat = new cv.Mat();
+    const mask_binary_u8_mat = new cv.Mat();
 
-      // upsample to overlay size
-      const mask_resized_mat = new cv.Mat();
+    for (let i = 0; i < NUM_FILTERED_RESULTS; i++) {
+      const mask = mask_sigmoid_mat.row(i).data32F;
+      const mask_mat = cv.matFromArray(
+        MASK_HEIGHT,
+        MASK_WIDTH,
+        cv.CV_32F,
+        mask
+      );
+
+      // Resize to overlay size
       cv.resize(
         mask_mat,
         mask_resized_mat,
-        new cv.Size(overlay_el.width, overlay_el.height),
+        new cv.Size(overlay_size[0], overlay_size[1]),
         cv.INTER_LINEAR
       );
 
-      // threshold
-      const mask_binary_mat = new cv.Mat();
-      const mask_binary_u8_mat = new cv.Mat();
-      cv.threshold(mask_resized_mat, mask_binary_mat, 0.5, 1, cv.THRESH_BINARY);
+      // Binarize to 0/1 mask
+      cv.threshold(
+        mask_resized_mat,
+        mask_binary_mat,
+        0.5,
+        255,
+        cv.THRESH_BINARY
+      );
       mask_binary_mat.convertTo(mask_binary_u8_mat, cv.CV_8U);
 
-      // crop and color
+      // ROI
       const [x, y, w, h] = filtered_results[i].bbox;
-      const x1 = Math.max(0, x);
-      const y1 = Math.max(0, y);
-      const x2 = Math.min(overlay_el.width, x + w);
-      const y2 = Math.min(overlay_el.height, y + h);
-
+      const x1 = Math.max(0, Math.floor(x));
+      const y1 = Math.max(0, Math.floor(y));
+      const x2 = Math.min(overlay_size[0], Math.ceil(x + w));
+      const y2 = Math.min(overlay_size[1], Math.ceil(y + h));
       const roi = mask_binary_u8_mat.roi(new cv.Rect(x1, y1, x2 - x1, y2 - y1));
+
+      // Colorize mask
       const color = Colors.getColor(filtered_results[i].class_idx, 0.6);
       const color_scalar = new cv.Scalar(
         color[0],
@@ -195,31 +305,37 @@ export const inference_pipeline = async (
         cv.CV_8UC4,
         color_scalar
       );
+
+      // Copy to overlay mat
       mask_colored_mat.copyTo(
         overlay_mat.roi(new cv.Rect(x1, y1, x2 - x1, y2 - y1)),
         roi
       );
 
-      roi.delete();
-      mask_resized_mat.delete();
-      mask_binary_mat.delete();
+      // release mat
       mask_mat.delete();
       mask_colored_mat.delete();
+      roi.delete();
     }
+    mask_resized_mat.delete();
+    mask_binary_mat.delete();
+    mask_binary_u8_mat.delete();
     mask_sigmoid_mat.delete();
 
-    // draw masks
     const imgData = new ImageData(
-      new Uint8ClampedArray(overlay_mat.data),
-      overlay_el.width,
-      overlay_el.height
+      new Uint8ClampedArray(
+        overlay_mat.data.buffer,
+        overlay_mat.data.byteOffset,
+        overlay_mat.data.byteLength
+      ),
+      overlay_size[0],
+      overlay_size[1]
     );
-    const ctx = overlay_el.getContext("2d");
-    ctx.clearRect(0, 0, overlay_el.width, overlay_el.height);
-    ctx.putImageData(imgData, 0, 0);
-
     overlay_mat.delete();
-  }
 
-  return [filtered_results, (end - start).toFixed(2)];
-};
+    return imgData;
+  } catch (error) {
+    console.error("Error masks:", error);
+    proto_mask_mat.delete();
+  }
+}

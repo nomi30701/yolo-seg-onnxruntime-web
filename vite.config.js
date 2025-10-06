@@ -1,22 +1,20 @@
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react-swc'
-import { viteStaticCopy } from "vite-plugin-static-copy"
-import tailwindcss from '@tailwindcss/vite'
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [
-    react(),
-    tailwindcss(),
-    viteStaticCopy({
-      targets: [
-        {
-          src: "node_modules/onnxruntime-web/dist/*.wasm",
-          dest: "./",
-        },
-      ],
+    react({
+      babel: {
+        plugins: [["babel-plugin-react-compiler"]],
+      },
     }),
+    tailwindcss(),
   ],
+  optimizeDeps: {
+    exclude: ["onnxruntime-web"],
+  },
   assetsInclude: ["**/*.onnx"],
-  base: "/yolo-segmentation-onnxruntime-web/"
-})
+  base: "/yolo-seg-onnxruntime-web/",
+});
