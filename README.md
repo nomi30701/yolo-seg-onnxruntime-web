@@ -1,6 +1,6 @@
-# yolo object detect onnxruntime-web
+# yolo segmentation onnxruntime-web
 
-<img src="./preview.png" height=60% width=60%>
+<img src="./preview.png" height=65% width=65%>
 
 ## ✨ Features
 
