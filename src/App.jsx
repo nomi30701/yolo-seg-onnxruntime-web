@@ -566,11 +566,13 @@ function ResultsTable({ details, currentClasses }) {
               <table className="w-full border-collapse min-w-full">
                 <thead>
                   <tr className="bg-gray-700 text-left">
-                    <th className="p-2 sm:p-3 rounded-tl-lg text-xs sm:text-sm">
+                    <th className="p-2 sm:p-3 rounded-tl-lg text-xs sm:text-sm text-left">
                       ID
                     </th>
-                    <th className="p-2 sm:p-3 text-xs sm:text-sm">Class</th>
-                    <th className="p-2 sm:p-3 rounded-tr-lg text-xs sm:text-sm">
+                    <th className="p-2 sm:p-3 text-xs sm:text-sm text-left">
+                      Class
+                    </th>
+                    <th className="p-2 sm:p-3 rounded-tr-lg text-xs sm:text-sm text-left">
                       Confidence
                     </th>
                   </tr>
@@ -583,13 +585,14 @@ function ResultsTable({ details, currentClasses }) {
                         index === details.length - 1 ? "border-b-0" : ""
                       }`}
                     >
-                      <td className="p-2 sm:p-3 font-mono text-xs sm:text-sm">
+                      <td className="p-2 sm:p-3 font-mono text-xs sm:text-sm text-left">
                         {index}
                       </td>
-                      <td className="p-2 sm:p-3 font-medium text-xs sm:text-sm">
-                        {currentClasses[item.class_idx]}
+                      <td className="p-2 sm:p-3 font-medium text-xs sm:text-sm text-left">
+                        {currentClasses[item.class_idx] ||
+                          `Class ${item.class_idx}`}
                       </td>
-                      <td className="p-2 sm:p-3 text-xs sm:text-sm">
+                      <td className="p-2 sm:p-3 text-xs sm:text-sm text-left">
                         <div className="flex items-center">
                           <div className="w-full bg-gray-600 rounded-full h-1.5 sm:h-2.5 mr-1 sm:mr-2 max-w-[70px] sm:max-w-[100px]">
                             <div
